@@ -17,3 +17,12 @@ A simple Streamlit app template for you to modify!
    ```
    $ streamlit run streamlit_app.py
    ```
+
+3. View quick visual summary
+
+   After uploading and processing files, download the CSV and view the "Quick Visual Summary" section under the "Download Results" area. It provides:
+
+   - A bar chart of average item means (per survey question).
+   - A line chart of Overall rating over time (Semester + Year).
+
+These charts are generated automatically from the processed CSV and provide an at-a-glance look at instructor performance.

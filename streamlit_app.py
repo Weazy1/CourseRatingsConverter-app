@@ -347,6 +347,40 @@ if uploaded_files:
                     file_name="evaluations.csv",
                     mime="text/csv"
                 )
+
+                # Quick visual summaries for at-a-glance performance
+                st.header("📊 Quick Visual Summary")
+                try:
+                    numeric_df = df.copy()
+                    # Convert all ' - Mean' columns to numeric
+                    mean_cols = [c for c in df.columns if c.endswith(' - Mean')]
+                    numeric_df[mean_cols] = numeric_df[mean_cols].apply(pd.to_numeric, errors='coerce')
+
+                    # Bar chart: average of each survey item (exclude Overall)
+                    item_mean_cols = [c for c in mean_cols if not c.startswith('Overall')]
+                    if item_mean_cols:
+                        avg_item_means = numeric_df[item_mean_cols].mean().rename(lambda x: x.replace(' - Mean',''))
+                        st.subheader('Average Item Means')
+                        st.bar_chart(avg_item_means)
+
+                    # Line chart: Overall mean over time (requires Year and Semester)
+                    if 'Overall - Mean' in df.columns:
+                        semester_order = {'Winter': 1, 'Spring': 2, 'Summer': 3, 'Fall': 4}
+                        df_times = numeric_df.copy()
+                        df_times['Year'] = pd.to_numeric(df_times['Year'], errors='coerce')
+                        df_times['SemesterOrder'] = df_times['Semester'].map(semester_order).fillna(99)
+                        df_times = df_times.sort_values(['Year', 'SemesterOrder'])
+                        df_times['Period'] = df_times.apply(
+                            lambda r: f"{int(r['Year'])} {r['Semester']}" if pd.notnull(r['Year']) and r['Semester'] else '',
+                            axis=1
+                        )
+                        overall_ts = df_times[['Period', 'Overall - Mean']].dropna()
+                        if not overall_ts.empty:
+                            overall_ts = overall_ts.groupby('Period')['Overall - Mean'].mean()
+                            st.subheader('Overall Rating Over Time')
+                            st.line_chart(overall_ts)
+                except Exception as e:
+                    st.warning(f"Could not generate charts: {e}")
             else:
                 st.error("❌ No data could be extracted from the files. Please check the file format.")
 
