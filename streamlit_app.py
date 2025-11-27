@@ -5,6 +5,18 @@ import io
 from pathlib import Path
 from html import unescape
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics.charts.barcharts import VerticalBarChart
 
 # Page configuration
 st.set_page_config(
@@ -51,6 +63,81 @@ def create_short_name(full_text):
     if short:
         short = short[0].upper() + short[1:] if len(short) > 1 else short.upper()
     return short
+
+def create_abbreviated_header(short_name):
+    """Create an abbreviated header name for table columns."""
+    # Map to very short abbreviations for table headers
+    abbreviation_mapping = {
+        "Explained clearly": "Explained",
+        "Effective teaching methods": "Teaching",
+        "Respectful interaction": "Respectful",
+        "Knowledgeable": "Knowledge",
+        "Overall rating": "Overall"
+    }
+    
+    # Check if we have a direct mapping
+    if short_name in abbreviation_mapping:
+        return abbreviation_mapping[short_name]
+    
+    # Fallback: use first word or first few letters
+    words = short_name.split()
+    if len(words) > 0:
+        return words[0][:8]  # First 8 characters of first word
+    return short_name[:8]
+
+def get_academic_year(semester, year):
+    """Determine academic year from semester and year.
+    Academic year runs Fall through Summer (e.g., Fall 2022-Summer 2023 = 2022-2023).
+    """
+    if not semester or not year:
+        return None
+    
+    semester = semester.strip()
+    year = int(year) if isinstance(year, (int, str)) and str(year).isdigit() else None
+    
+    if not year:
+        return None
+    
+    # Fall semester starts the academic year
+    if semester == 'Fall':
+        return f"{year}-{year + 1}"
+    # Winter, Spring, Summer belong to the academic year that started the previous Fall
+    elif semester in ['Winter', 'Spring', 'Summer']:
+        return f"{year - 1}-{year}"
+    else:
+        return None
+
+def organize_by_term(data_list):
+    """Organize evaluation data by term within each academic year.
+    Returns a dictionary: {academic_year: {term: [courses]}}
+    Term order: Fall, Winter, Spring, Summer
+    """
+    term_order = {'Fall': 1, 'Winter': 2, 'Spring': 3, 'Summer': 4}
+    organized = {}
+    
+    for data in data_list:
+        semester = data.get('Semester', '')
+        year = data.get('Year', '')
+        academic_year = get_academic_year(semester, year)
+        
+        if not academic_year:
+            continue
+        
+        if academic_year not in organized:
+            organized[academic_year] = {}
+        
+        if semester not in organized[academic_year]:
+            organized[academic_year][semester] = []
+        
+        organized[academic_year][semester].append(data)
+    
+    # Sort terms within each academic year
+    for academic_year in organized:
+        sorted_terms = sorted(organized[academic_year].items(), 
+                             key=lambda x: term_order.get(x[0], 99))
+        organized[academic_year] = dict(sorted_terms)
+    
+    return organized
 
 def parse_evaluation_content(content, filename=""):
     """Parse evaluation file content and extract all data."""
@@ -185,8 +272,9 @@ def parse_evaluation_content(content, filename=""):
     return result
 
 def process_files(uploaded_files):
-    """Process uploaded files and return data."""
+    """Process uploaded files and return data with annual PDFs grouped by academic year."""
     all_data = []
+    annual_pdf_data_list = []  # List of tuples: (pdf_bytes, filename, course_count)
     survey_items = None
     processed_count = 0
     error_count = 0
@@ -199,12 +287,14 @@ def process_files(uploaded_files):
                 # Extract survey items from first file
                 if survey_items is None and '_survey_items' in data:
                     survey_items = data['_survey_items']
-                # Remove internal keys
-                if '_survey_items' in data:
-                    del data['_survey_items']
-                if '_filename' in data:
-                    del data['_filename']
-                all_data.append(data)
+                
+                # Remove internal keys before adding to all_data
+                data_copy = data.copy()
+                if '_survey_items' in data_copy:
+                    del data_copy['_survey_items']
+                if '_filename' in data_copy:
+                    del data_copy['_filename']
+                all_data.append(data_copy)
                 processed_count += 1
             else:
                 error_count += 1
@@ -222,7 +312,33 @@ def process_files(uploaded_files):
             5: "Overall, I rate the instructor highly."
         }
     
-    return all_data, survey_items, processed_count, error_count
+    # Group data by instructor and academic year, then generate annual PDFs
+    if all_data:
+        # Group by instructor first
+        by_instructor = {}
+        for data in all_data:
+            instructor = data.get('Instructor', 'UNKNOWN')
+            if instructor not in by_instructor:
+                by_instructor[instructor] = []
+            by_instructor[instructor].append(data)
+        
+        # For each instructor, group by academic year and generate PDFs
+        for instructor, instructor_data in by_instructor.items():
+            # Organize by academic year and term
+            organized = organize_by_term(instructor_data)
+            
+            # Generate PDF for each academic year
+            for academic_year, year_data in organized.items():
+                try:
+                    pdf_bytes = generate_annual_pdf_report(year_data, instructor, academic_year, survey_items)
+                    pdf_filename = generate_annual_pdf_filename(instructor, academic_year)
+                    # Count total courses in this academic year
+                    total_courses = sum(len(courses) for courses in year_data.values())
+                    annual_pdf_data_list.append((pdf_bytes, pdf_filename, total_courses))
+                except Exception as pdf_error:
+                    st.warning(f"Could not generate PDF for {instructor} - {academic_year}: {str(pdf_error)}")
+    
+    return all_data, survey_items, processed_count, error_count, annual_pdf_data_list
 
 def create_dataframe(all_data, survey_items):
     """Create a pandas DataFrame with descriptive column names."""
@@ -283,6 +399,585 @@ def generate_csv(df):
     df.to_csv(output, index=False)
     return output.getvalue()
 
+def generate_annual_pdf_filename(instructor_name, academic_year):
+    """Generate filename for annual PDF report."""
+    instructor_lastname = instructor_name.split(',')[0].strip() if instructor_name else 'UNKNOWN'
+    instructor_lastname = re.sub(r'[^\w\-_]', '', instructor_lastname)
+    return f"{instructor_lastname}_{academic_year}.pdf"
+
+def create_term_chart(term_data, survey_items, term_name):
+    """Create a bar chart showing average ratings for each survey item across all courses in a term."""
+    # Calculate average for each item across all courses
+    item_means = {}
+    for item_num in range(1, 6):
+        values = []
+        for course in term_data:
+            mean = course.get(f'Item_{item_num}_Mean', '')
+            if mean != '' and mean is not None and isinstance(mean, (int, float)):
+                values.append(mean)
+        if values:
+            item_means[item_num] = sum(values) / len(values)
+        else:
+            item_means[item_num] = 0
+    
+    # Get item names
+    item_names = []
+    for item_num in range(1, 6):
+        if item_num in survey_items:
+            item_name = create_short_name(survey_items[item_num])
+            # Truncate long names
+            if len(item_name) > 20:
+                item_name = item_name[:17] + '...'
+            item_names.append(item_name)
+        else:
+            item_names.append(f'Item {item_num}')
+    
+    # Create the chart
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    bars = ax.bar(range(len(item_names)), [item_means[i] for i in range(1, 6)], 
+                   color=['#2c5aa0', '#3d6bb3', '#5a7fb8', '#7a9bc4', '#9ab5d0'])
+    
+    # Add value labels on bars
+    for i, (bar, value) in enumerate(zip(bars, [item_means[i] for i in range(1, 6)])):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                f'{value:.2f}',
+                ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    ax.set_xticks(range(len(item_names)))
+    ax.set_xticklabels(item_names, rotation=15, ha='right', fontsize=9)
+    ax.set_ylabel('Average Rating', fontsize=10, fontweight='bold')
+    ax.set_title(f'{term_name} - Average Ratings by Survey Item', fontsize=11, fontweight='bold', pad=10)
+    ax.set_ylim(0, 5.5)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.axhline(y=4.0, color='green', linestyle='--', alpha=0.5, linewidth=1, label='Target (4.0)')
+    
+    plt.tight_layout()
+    
+    # Save to bytes
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+def create_overall_trend_chart(year_data, academic_year):
+    """Create a line chart showing overall rating trends across terms."""
+    term_order = ['Fall', 'Winter', 'Spring', 'Summer']
+    terms = []
+    overall_means = []
+    
+    for term in term_order:
+        if term in year_data and year_data[term]:
+            term_courses = year_data[term]
+            values = []
+            for course in term_courses:
+                overall = course.get('Overall_Mean', '')
+                if overall != '' and overall is not None and isinstance(overall, (int, float)):
+                    values.append(overall)
+            if values:
+                terms.append(term)
+                overall_means.append(sum(values) / len(values))
+    
+    if len(terms) < 2:
+        return None  # Need at least 2 points for a trend
+    
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(terms, overall_means, marker='o', linewidth=2.5, markersize=8, 
+            color='#2c5aa0', markerfacecolor='#5a7fb8', markeredgewidth=2, markeredgecolor='#1f4788')
+    
+    # Add value labels
+    for term, value in zip(terms, overall_means):
+        ax.text(term, value + 0.1, f'{value:.2f}', ha='center', va='bottom', 
+                fontsize=9, fontweight='bold')
+    
+    ax.set_ylabel('Average Overall Rating', fontsize=10, fontweight='bold')
+    ax.set_title(f'Academic Year {academic_year} - Overall Rating Trend', 
+                 fontsize=11, fontweight='bold', pad=10)
+    ax.set_ylim(0, 5.5)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    ax.axhline(y=4.0, color='green', linestyle='--', alpha=0.5, linewidth=1)
+    
+    plt.tight_layout()
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+def create_term_summary_table(term_data, survey_items):
+    """Create a summary table for all courses in a term.
+    Returns table data ready for ReportLab Table.
+    """
+    # Build header row with abbreviated names
+    header = ['Course', 'Enroll']
+    
+    # Add item mean columns with abbreviated names
+    for item_num in range(1, 6):
+        if item_num in survey_items:
+            item_name = create_short_name(survey_items[item_num])
+            abbrev = create_abbreviated_header(item_name)
+        else:
+            abbrev = f'Item{item_num}'
+        header.append(abbrev)
+    
+    header.append('Overall')
+    header.append('Resp %')
+    
+    # Build data rows
+    rows = [header]
+    
+    for course in term_data:
+        row = []
+        # Combine Course Code and Name, truncate name to save space
+        course_code = course.get('Course_Code', 'N/A')
+        course_name = course.get('Course_Name', 'N/A')
+        # Limit course name to 25 characters
+        if len(course_name) > 25:
+            course_name = course_name[:22] + '...'
+        # Combine: "CODE: Name"
+        combined = f"{course_code}: {course_name}" if course_name != 'N/A' else course_code
+        row.append(combined)
+        
+        # Enrollment
+        row.append(str(course.get('Enrollment', 'N/A')) if course.get('Enrollment', '') != '' else 'N/A')
+        
+        # Add item means
+        for item_num in range(1, 6):
+            mean = course.get(f'Item_{item_num}_Mean', '')
+            if mean != '' and mean is not None and isinstance(mean, (int, float)):
+                row.append(f"{mean:.2f}")
+            else:
+                row.append('N/A')
+        
+        # Overall mean
+        overall_mean = course.get('Overall_Mean', '')
+        if overall_mean != '' and overall_mean is not None and isinstance(overall_mean, (int, float)):
+            row.append(f"{overall_mean:.2f}")
+        else:
+            row.append('N/A')
+        
+        # Response rate (use first item's response rate as representative)
+        response_rate = course.get('Item_1_Response_Rate', '')
+        if response_rate != '' and response_rate is not None:
+            row.append(f"{response_rate}%")
+        else:
+            row.append('N/A')
+        
+        rows.append(row)
+    
+    return rows
+
+def generate_annual_pdf_report(year_data, instructor_name, academic_year, survey_items):
+    """Generate a professional annual PDF report for an academic year, organized by term.
+    year_data: dict with structure {term: [list of course data]}
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter,
+                           rightMargin=0.5*inch, leftMargin=0.5*inch,
+                           topMargin=0.75*inch, bottomMargin=0.75*inch)
+    
+    elements = []
+    
+    # Define styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#1f4788'),
+        spaceAfter=15,
+        alignment=TA_CENTER,
+        leading=28
+    )
+    subtitle_style = ParagraphStyle(
+        'Subtitle',
+        parent=styles['Normal'],
+        fontSize=14,
+        textColor=colors.HexColor('#5a7fb8'),
+        spaceAfter=25,
+        alignment=TA_CENTER,
+        leading=18
+    )
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#2c5aa0'),
+        spaceAfter=10,
+        spaceBefore=25
+    )
+    term_style = ParagraphStyle(
+        'TermHeading',
+        parent=styles['Heading2'],
+        fontSize=15,
+        textColor=colors.HexColor('#1f4788'),
+        spaceAfter=10,
+        spaceBefore=20,
+        borderWidth=0,
+        borderPadding=5,
+        backColor=colors.HexColor('#e8eef5')
+    )
+    summary_style = ParagraphStyle(
+        'Summary',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=colors.HexColor('#666666'),
+        spaceAfter=8,
+        alignment=TA_LEFT
+    )
+    
+    # Title Section with enhanced styling
+    title_text = f"<b>Instructor Evaluation Report</b>"
+    elements.append(Paragraph(title_text, title_style))
+    
+    subtitle_text = f"{instructor_name}<br/>Academic Year {academic_year}"
+    elements.append(Paragraph(subtitle_text, subtitle_style))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Add overall trend chart at the beginning if we have multiple terms
+    trend_chart = create_overall_trend_chart(year_data, academic_year)
+    if trend_chart:
+        try:
+            img = Image(trend_chart, width=6*inch, height=3*inch)
+            elements.append(img)
+            elements.append(Spacer(1, 0.25*inch))
+        except:
+            pass  # Skip chart if there's an error
+    
+    # Process each term in order: Fall, Winter, Spring, Summer
+    term_order = ['Fall', 'Winter', 'Spring', 'Summer']
+    
+    for term in term_order:
+        if term not in year_data or not year_data[term]:
+            continue
+        
+        term_courses = year_data[term]
+        
+        # Term header with background
+        term_year = term_courses[0].get('Year', '') if term_courses else ''
+        term_header = f"{term} {term_year}"
+        elements.append(Paragraph(term_header, term_style))
+        elements.append(Spacer(1, 0.15*inch))
+        
+        # Add term summary statistics
+        total_enrollment = sum(c.get('Enrollment', 0) or 0 for c in term_courses if isinstance(c.get('Enrollment'), (int, float)))
+        avg_overall = []
+        for course in term_courses:
+            overall = course.get('Overall_Mean', '')
+            if overall != '' and overall is not None and isinstance(overall, (int, float)):
+                avg_overall.append(overall)
+        avg_overall_str = f"{sum(avg_overall)/len(avg_overall):.2f}" if avg_overall else "N/A"
+        
+        summary_text = f"<b>Summary:</b> {len(term_courses)} course(s) | Total Enrollment: {total_enrollment} | Average Overall Rating: {avg_overall_str}"
+        elements.append(Paragraph(summary_text, summary_style))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        # Add term chart
+        try:
+            term_chart_buf = create_term_chart(term_courses, survey_items, f"{term} {term_year}")
+            chart_img = Image(term_chart_buf, width=5.5*inch, height=3.2*inch)
+            elements.append(chart_img)
+            elements.append(Spacer(1, 0.15*inch))
+        except Exception as e:
+            pass  # Skip chart if there's an error
+        
+        # Create summary table for this term with enhanced styling
+        table_data = create_term_summary_table(term_courses, survey_items)
+        
+        if table_data and len(table_data) > 1:
+            # Convert header row to Paragraph objects with rotation for slanted text
+            header_style = ParagraphStyle(
+                'TableHeader',
+                parent=styles['Normal'],
+                fontSize=9,
+                textColor=colors.whitesmoke,
+                fontName='Helvetica-Bold',
+                alignment=TA_CENTER,
+                leading=10
+            )
+            
+            # Replace header strings with Paragraph objects (rotated text)
+            header_row = table_data[0]
+            rotated_headers = []
+            for header_text in header_row:
+                # Use Paragraph for text wrapping, with slight rotation effect via smaller font
+                # ReportLab doesn't support true rotation in tables, so we'll use wrapped text
+                para = Paragraph(f"<b>{header_text}</b>", header_style)
+                rotated_headers.append(para)
+            
+            # Replace first row with Paragraph objects
+            table_data[0] = rotated_headers
+            
+            # Calculate column widths - adjusted for combined Course column
+            num_cols = len(table_data[0])
+            available_width = 7*inch
+            # New structure: Course (combined), Enroll, 5 items, Overall, Resp %
+            if num_cols == 9:  # Course, Enroll, 5 items, Overall, Resp %
+                col_widths = [2.2*inch, 0.5*inch] + [0.55*inch] * 5 + [0.6*inch, 0.5*inch]
+            else:
+                # Fallback: flexible distribution
+                col_widths = [2.0*inch] + [0.55*inch] * (num_cols - 1)
+            
+            total_width = sum(col_widths)
+            if total_width > available_width:
+                scale = available_width / total_width
+                col_widths = [w * scale for w in col_widths]
+            
+            term_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+            
+            # Enhanced table styling
+            term_table.setStyle(TableStyle([
+                # Header row - enhanced with more padding for rotated text
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f4788')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, 0), 'MIDDLE'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('TOPPADDING', (0, 0), (-1, 0), 12),
+                ('LEFTPADDING', (0, 0), (-1, 0), 4),
+                ('RIGHTPADDING', (0, 0), (-1, 0), 4),
+                ('LINEBELOW', (0, 0), (-1, 0), 2, colors.HexColor('#0d3d6b')),
+                # Data rows - enhanced readability
+                ('ALIGN', (0, 1), (0, -1), 'LEFT'),  # Course (combined)
+                ('ALIGN', (1, 1), (1, -1), 'CENTER'),  # Enrollment
+                ('ALIGN', (2, 1), (-1, -1), 'CENTER'),  # All numeric columns
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (0, -1), 8.5),  # Course column slightly smaller
+                ('FONTSIZE', (1, 1), (-1, -1), 9),  # Other columns
+                ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+                ('TOPPADDING', (0, 1), (-1, -1), 6),
+                ('LEFTPADDING', (0, 1), (-1, -1), 4),
+                ('RIGHTPADDING', (0, 1), (-1, -1), 4),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d0d0d0')),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f7fa')]),
+                ('VALIGN', (0, 1), (-1, -1), 'MIDDLE'),
+                # Add color coding for high ratings (4.0+)
+                ('TEXTCOLOR', (2, 1), (6, -1), colors.HexColor('#2d5a27')),  # Green for item means
+                ('TEXTCOLOR', (7, 1), (7, -1), colors.HexColor('#1f4788')),  # Blue for overall
+                # Left border for first column
+                ('LINEBEFORE', (0, 0), (0, -1), 1, colors.HexColor('#e0e0e0')),
+            ]))
+            elements.append(term_table)
+            elements.append(Spacer(1, 0.3*inch))
+    
+    # Add page break before detailed course breakdowns
+    elements.append(PageBreak())
+    
+    # Detailed Course-by-Course Breakdown Section
+    section_heading_style = ParagraphStyle(
+        'SectionHeading',
+        parent=styles['Heading1'],
+        fontSize=18,
+        textColor=colors.HexColor('#1f4788'),
+        spaceAfter=15,
+        spaceBefore=10,
+        alignment=TA_CENTER
+    )
+    
+    elements.append(Paragraph("<b>Detailed Course-by-Course Breakdown</b>", section_heading_style))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Process each term again for detailed breakdowns
+    for term in term_order:
+        if term not in year_data or not year_data[term]:
+            continue
+        
+        term_courses = year_data[term]
+        term_year = term_courses[0].get('Year', '') if term_courses else ''
+        
+        # Term section header
+        elements.append(Paragraph(f"<b>{term} {term_year}</b>", heading_style))
+        elements.append(Spacer(1, 0.15*inch))
+        
+        # Detailed breakdown for each course in this term
+        for course_idx, course in enumerate(term_courses, 1):
+            course_code = course.get('Course_Code', 'N/A')
+            course_name = course.get('Course_Name', 'N/A')
+            instructor = course.get('Instructor', 'N/A')
+            enrollment = course.get('Enrollment', 'N/A')
+            semester = course.get('Semester', 'N/A')
+            year = course.get('Year', 'N/A')
+            
+            # Course header
+            course_header_style = ParagraphStyle(
+                'CourseHeader',
+                parent=styles['Heading2'],
+                fontSize=12,
+                textColor=colors.HexColor('#2c5aa0'),
+                spaceAfter=8,
+                spaceBefore=12
+            )
+            
+            course_title = f"<b>{course_code}: {course_name}</b>"
+            elements.append(Paragraph(course_title, course_header_style))
+            
+            # Course info table
+            info_data = [
+                ['Instructor:', instructor],
+                ['Semester:', f"{semester} {year}"],
+                ['Enrollment:', str(enrollment) if enrollment != 'N/A' else 'N/A']
+            ]
+            
+            info_table = Table(info_data, colWidths=[1.5*inch, 5.5*inch])
+            info_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#e8eef5')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ]))
+            elements.append(info_table)
+            elements.append(Spacer(1, 0.1*inch))
+            
+            # Survey Items Statistics
+            items_data = [['Survey Item', 'Mean', 'SD', 'N', 'Rank', 'Response Rate']]
+            
+            for item_num in range(1, 6):
+                if item_num in survey_items:
+                    item_text = survey_items[item_num]
+                    # Truncate long item text
+                    if len(item_text) > 50:
+                        item_text = item_text[:47] + '...'
+                else:
+                    item_text = f"Item {item_num}"
+                
+                mean = course.get(f'Item_{item_num}_Mean', '')
+                sd = course.get(f'Item_{item_num}_SD', '')
+                n = course.get(f'Item_{item_num}_N', '')
+                rank = course.get(f'Item_{item_num}_Rank', '')
+                response_rate = course.get(f'Item_{item_num}_Response_Rate', '')
+                
+                mean_str = f"{mean:.2f}" if mean != '' and mean is not None and isinstance(mean, (int, float)) else 'N/A'
+                sd_str = f"{sd:.2f}" if sd != '' and sd is not None and isinstance(sd, (int, float)) else 'N/A'
+                n_str = str(n) if n != '' and n is not None else 'N/A'
+                rank_str = str(rank) if rank != '' and rank is not None else 'N/A'
+                resp_str = f"{response_rate}%" if response_rate != '' and response_rate is not None else 'N/A'
+                
+                items_data.append([item_text, mean_str, sd_str, n_str, rank_str, resp_str])
+            
+            # Overall statistics
+            overall_mean = course.get('Overall_Mean', '')
+            overall_sd = course.get('Overall_SD', '')
+            overall_n = course.get('Overall_N', '')
+            
+            overall_mean_str = f"{overall_mean:.2f}" if overall_mean != '' and overall_mean is not None and isinstance(overall_mean, (int, float)) else 'N/A'
+            overall_sd_str = f"{overall_sd:.2f}" if overall_sd != '' and overall_sd is not None and isinstance(overall_sd, (int, float)) else 'N/A'
+            overall_n_str = str(overall_n) if overall_n != '' and overall_n is not None else 'N/A'
+            
+            items_data.append(['<b>Overall</b>', overall_mean_str, overall_sd_str, overall_n_str, '—', '—'])
+            
+            items_table = Table(items_data, colWidths=[3.5*inch, 0.7*inch, 0.7*inch, 0.6*inch, 0.6*inch, 0.8*inch])
+            items_table.setStyle(TableStyle([
+                # Header
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c5aa0')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+                ('TOPPADDING', (0, 0), (-1, 0), 6),
+                # Data rows
+                ('ALIGN', (0, 1), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('BOTTOMPADDING', (0, 1), (-1, -1), 4),
+                ('TOPPADDING', (0, 1), (-1, -1), 4),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f7fa')]),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                # Overall row styling
+                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e8eef5')),
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ]))
+            elements.append(items_table)
+            
+            # Response distribution table
+            dist_header = ['Response', 'Strongly Agree', 'Agree', 'Neutral', 'Disagree', 'Strongly Disagree']
+            dist_data = [dist_header]
+            
+            for item_num in range(1, 6):
+                if item_num in survey_items:
+                    item_text = survey_items[item_num]
+                    if len(item_text) > 30:
+                        item_text = item_text[:27] + '...'
+                else:
+                    item_text = f"Item {item_num}"
+                
+                pct_sa = course.get(f'Item_{item_num}_Pct_Strongly_Agree', '')
+                pct_a = course.get(f'Item_{item_num}_Pct_Agree', '')
+                pct_n = course.get(f'Item_{item_num}_Pct_Neutral', '')
+                pct_d = course.get(f'Item_{item_num}_Pct_Disagree', '')
+                pct_sd = course.get(f'Item_{item_num}_Pct_Strongly_Disagree', '')
+                
+                dist_data.append([
+                    item_text,
+                    f"{pct_sa}%" if pct_sa != '' and pct_sa is not None else 'N/A',
+                    f"{pct_a}%" if pct_a != '' and pct_a is not None else 'N/A',
+                    f"{pct_n}%" if pct_n != '' and pct_n is not None else 'N/A',
+                    f"{pct_d}%" if pct_d != '' and pct_d is not None else 'N/A',
+                    f"{pct_sd}%" if pct_sd != '' and pct_sd is not None else 'N/A'
+                ])
+            
+            # Overall response distribution
+            overall_pct_sa = course.get('Overall_Pct_Strongly_Agree', '')
+            overall_pct_a = course.get('Overall_Pct_Agree', '')
+            overall_pct_n = course.get('Overall_Pct_Neutral', '')
+            overall_pct_d = course.get('Overall_Pct_Disagree', '')
+            overall_pct_sd = course.get('Overall_Pct_Strongly_Disagree', '')
+            
+            dist_data.append([
+                '<b>Overall</b>',
+                f"{overall_pct_sa}%" if overall_pct_sa != '' and overall_pct_sa is not None else 'N/A',
+                f"{overall_pct_a}%" if overall_pct_a != '' and overall_pct_a is not None else 'N/A',
+                f"{overall_pct_n}%" if overall_pct_n != '' and overall_pct_n is not None else 'N/A',
+                f"{overall_pct_d}%" if overall_pct_d != '' and overall_pct_d is not None else 'N/A',
+                f"{overall_pct_sd}%" if overall_pct_sd != '' and overall_pct_sd is not None else 'N/A'
+            ])
+            
+            dist_table = Table(dist_data, colWidths=[2.5*inch, 0.9*inch, 0.9*inch, 0.9*inch, 0.9*inch, 0.9*inch])
+            dist_table.setStyle(TableStyle([
+                # Header
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#5a7fb8')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+                ('TOPPADDING', (0, 0), (-1, 0), 6),
+                # Data rows
+                ('ALIGN', (0, 1), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('BOTTOMPADDING', (0, 1), (-1, -1), 4),
+                ('TOPPADDING', (0, 1), (-1, -1), 4),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f7fa')]),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                # Overall row
+                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e8eef5')),
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ]))
+            
+            elements.append(Spacer(1, 0.1*inch))
+            elements.append(dist_table)
+            elements.append(Spacer(1, 0.2*inch))
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 # Main app
 st.title("📊 Instructor Evaluation Parser")
 st.markdown("Upload HTML evaluation files to extract and analyze instructor evaluation data.")
@@ -302,7 +997,7 @@ if uploaded_files:
     # Process button
     if st.button("🚀 Process Files", type="primary"):
         with st.spinner("Processing files..."):
-            all_data, survey_items, processed_count, error_count = process_files(uploaded_files)
+            all_data, survey_items, processed_count, error_count, annual_pdf_data_list = process_files(uploaded_files)
             
             if all_data:
                 # Create DataFrame
@@ -311,6 +1006,7 @@ if uploaded_files:
                 # Store in session state
                 st.session_state['df'] = df
                 st.session_state['survey_items'] = survey_items
+                st.session_state['annual_pdf_data_list'] = annual_pdf_data_list
                 
                 # Show success message
                 st.success(f"✅ Successfully processed {processed_count} file(s)!")
@@ -338,8 +1034,57 @@ if uploaded_files:
                 st.header("📋 Data Preview")
                 st.dataframe(df, use_container_width=True, height=400)
                 
+                # Download Annual PDFs Section
+                st.header("📄 Download Annual PDF Reports")
+                pdf_count = len(annual_pdf_data_list)
+                if pdf_count > 0:
+                    st.success(f"✅ {pdf_count} annual PDF report(s) generated successfully!")
+                    
+                    # Display PDF download buttons with academic year and course count
+                    if pdf_count <= 3:
+                        # Show all PDFs in columns if 3 or fewer
+                        cols = st.columns(min(pdf_count, 3))
+                        pdf_idx = 0
+                        for pdf_bytes, pdf_filename, course_count in annual_pdf_data_list:
+                            if pdf_bytes is not None:
+                                with cols[pdf_idx % len(cols)]:
+                                    # Extract academic year from filename for display
+                                    academic_year = pdf_filename.replace('.pdf', '').split('_')[-1] if '_' in pdf_filename else 'Unknown'
+                                    st.download_button(
+                                        label=f"📥 {academic_year}\n({course_count} courses)",
+                                        data=pdf_bytes,
+                                        file_name=pdf_filename,
+                                        mime="application/pdf",
+                                        key=f"annual_pdf_download_{pdf_idx}",
+                                        help=f"Academic Year {academic_year} - {course_count} courses"
+                                    )
+                                pdf_idx += 1
+                    else:
+                        # Use expandable sections for many PDFs
+                        with st.expander(f"📄 Download Annual PDF Reports ({pdf_count} academic years)", expanded=True):
+                            pdf_idx = 0
+                            for pdf_bytes, pdf_filename, course_count in annual_pdf_data_list:
+                                if pdf_bytes is not None:
+                                    # Extract academic year from filename for display
+                                    academic_year = pdf_filename.replace('.pdf', '').split('_')[-1] if '_' in pdf_filename else 'Unknown'
+                                    col1, col2 = st.columns([3, 1])
+                                    with col1:
+                                        st.markdown(f"**Academic Year {academic_year}** - {course_count} courses")
+                                        st.caption(pdf_filename)
+                                    with col2:
+                                        st.download_button(
+                                            label="📥 Download",
+                                            data=pdf_bytes,
+                                            file_name=pdf_filename,
+                                            mime="application/pdf",
+                                            key=f"annual_pdf_download_{pdf_idx}"
+                                        )
+                                    pdf_idx += 1
+                else:
+                    st.warning("⚠️ No PDFs could be generated. Please check the file format.")
+                
                 # Download CSV
-                st.header("💾 Download Results")
+                st.header("💾 Download CSV")
                 csv_data = generate_csv(df)
                 st.download_button(
                     label="📥 Download CSV",
